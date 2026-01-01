@@ -87,6 +87,9 @@ fn main() {
 ---
 **Disclaimer:** This project is an architectural study in high-performance system design. While the logic is sound, it is currently in an experimental phase. Contributions and discussions are welcome.
 
+##AI generate code promt
+
+```
 Cache devise
 K,V型態：
 Arc
@@ -140,5 +143,6 @@ where
     main: Cache<K, V>,// 操作
     sub: Cache<K, V>, //映射查詢
 }
+```
 
  
