@@ -87,7 +87,7 @@ fn main() {
 ---
 **Disclaimer:** This project is an architectural study in high-performance system design. While the logic is sound, it is currently in an experimental phase. Contributions and discussions are welcome.
 
-##AI generate code promt
+## 🤖AI generate code promt
 
 ```
 Cache devise
