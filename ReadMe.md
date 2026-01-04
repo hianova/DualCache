@@ -91,55 +91,58 @@ fn main() {
 
 ```
 DualCache 設計底稿
-K,V型態：
+-K,V型態：
 Arc（Zero-copy cloning）
-map結構：
+-map結構：
 資料主要儲存在arena可以保存檔案位置以及對應欄位
-排名熱點：
+-排名熱點：
 每個呼叫無條件往前arena swap
-累積次數：
+-累積次數：
 累積呼叫次數計算平均
-平均淘汰：
-到達arena capacity evict_point 以下  truncate 
-累積豁免：
-有時高累積的會掉落平均值以下的arena位置則保底evict point之前
-過期刷新:
+-平均淘汰：
+到達arena capacity evict_point 以下  truncate 
+-累積豁免：
+有時高累積的會掉落平均值以下的arena位置則保底evict_point之前
+-過期刷新:
 排程每天0:00檢查time_stamp 根據arena 刷新hashmap index 並且執行 counter >> 1
-映像存取：
+-映像存取：
 Blue-Green Deployment快取架構的避免hashmap鎖
+-新增豁免：
+arena.len> capacity/2 時 新增資料append後evict_point+1 與其互換位置
+-evict_point刷新：
+arena.len> capacity/2 時 每次呼叫其他資料檢查evict_point counter 是否小於avg 否則evict_point +1
 
 
 #[derive(Clone, Debug)]
 pub struct Node<K, V> {
-    pub key: K, //檔案路徑和欄位名稱
-    pub value: V, //資料
-    pub counter: usize, //呼叫次數
-    pub time_stamp: usize, //定期銷毀
+    pub key: K, //檔案路徑和欄位名稱
+    pub value: V, //資料
+    pub counter: u64, //呼叫次數
+    pub time_stamp: u64, //定期銷毀
 }
+
 struct Cache<K, V>
 where
-    K: Hash + Eq,
+    K: Hash + Eq,
 {
-    arena: Vec<Node<K, V>>, //熱點儲存排序
-    index: HashMap<K, usize>, //索引
-    counter_sum: usize, //呼叫總和 
-    evict_point:usize, //平均對應節點
-    lazy_update:DeqVec, //main操作緩衝
+    arena: Vec<Node<K, V>>, //熱點儲存排序 
+    index: HashMap<K, usize>, //索引 
+    counter_sum: usize, //呼叫總和 預設：0
+    evict_point:usize, //平均對應節點 預設：capacity/2
+    capacity:usize, //自定義容器
 }
-pub trait CacheOps
-{
-    fn read;
-    fn create; 
-    fn delete; 
-    fn update;
-    fn daemon;
-}
+
 pub struct DualCache<K, V>
 where
-    K: Hash + Eq + Clone,
+    K: Hash + Eq + Clone,
 {
-    main: Cache<K, V>,// 操作
-    sub: Cache<K, V>, //映射查詢
+    main: Mutex<Cache<K, V>>,// 操作
+    mirror: Arcswap<Cache<K, V>>, //映射查詢
+    lazy_update:Mutex<VecDeque<CacheAction<K>>>, //main操作緩衝
+}
+
+impl DualCache{
+    fn daemon;
 }
 ```
 
