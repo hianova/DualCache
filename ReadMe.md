@@ -181,6 +181,26 @@ Implement the methods for `Cache` and `DualCache` following these EXACT rules:
 - Action: `node.counter >>= 1` (Bitwise right shift).
 - Reset `counter_sum` based on new values.
 
+## E. `Cache::remove(key)` -> "The Exile Protocol" (O(1) Deletion)
+**CRITICAL**: DO NOT use `Vec::remove()`. That causes O(N) shifting.
+Instead, implement "Swap-to-Death":
+
+1. Look up `target_idx` in `index`.
+2. **The Swap**: 
+   - Swap the item at `target_idx` with the item at `arena.len() - 1` (The Physical Tail).
+   - Update the `index` map for the item that was at the tail (it has now moved to `target_idx`).
+3. **The Execution**:
+   - Now the target item is at the tail.
+   - Remove the key from `index`.
+   - Perform `arena.pop()` to physically remove it from the vector.
+   - *Result*: The hole is plugged by the tail element. Complexity is O(1).
+
+## F. `Cache::cleanup_expired()` -> "The Purge"
+- Iterate through arena.
+- For any node where `current_time - node.timestamp > ttl`:
+  - Execute **"The Exile Protocol"** (as defined above).
+  - *Optimization*: Since we are iterating, we can maintain a "swap window" to keep the array compact without `pop` overhead, or just repeatedly call the O(1) remove.
+
 # 3. DualCache Concurrency Strategy
 - **Read Path (`get`)**: 
   - Try reading from `mirror` (ArcSwap) first (lock-free).
