@@ -90,60 +90,109 @@ fn main() {
 ## 🤖AI generate code promt
 
 ```
-DualCache 設計底稿
--K,V型態：
-Arc（Zero-copy cloning）
--map結構：
-資料主要儲存在arena可以保存檔案位置以及對應欄位
--排名熱點：
-每個呼叫無條件往前arena swap
--累積次數：
-累積呼叫次數計算平均
--平均淘汰：
-到達arena capacity evict_point 以下  truncate 
--累積豁免：
-有時高累積的會掉落平均值以下的arena位置則保底evict_point之前
--過期刷新:
-排程每天0:00檢查time_stamp 根據arena 刷新hashmap index 並且執行 counter >> 1
--映像存取：
-Blue-Green Deployment快取架構的避免hashmap鎖
--新增豁免：
-arena.len> capacity/2 時 新增資料append後evict_point+1 與其互換位置
--evict_point刷新：
-arena.len> capacity/2 時 每次呼叫其他資料檢查evict_point counter 是否小於avg 否則evict_point +1
+# Role
+You are a Senior Systems Architect and Rust Expert specializing in high-performance, non-standard data structures.
 
+# Objective
+Implement the `DualCache` system in Rust. 
+**CRITICAL WARNING**: This is a custom topology based on "Physical Location Flow" (Viscous Array). 
+- 🚫 DO NOT implement standard LRU/LFU logic. 
+- 🚫 DO NOT use `LinkedHashMap` or move-to-head on access.
+- ✅ Follow the specific "Swap-One" and "Evict-Point" logic described below.
+
+# 1. Data Structures (Immutable Contract)
+Use these exact struct definitions. Do not change them.
+
+```rust
+use std::sync::Arc;
+use parking_lot::Mutex; // Preferred over std::sync::Mutex for performance
+use arc_swap::ArcSwap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 
 #[derive(Clone, Debug)]
 pub struct Node<K, V> {
-    pub key: K, //檔案路徑和欄位名稱
-    pub value: V, //資料
-    pub counter: u64, //呼叫次數
-    pub time_stamp: u64, //定期銷毀
+    pub key: K, 
+    pub value: V, 
+    pub counter: u64, // Access frequency
+    pub time_stamp: u64, // For expiration check
 }
 
+// The internal storage unit
 struct Cache<K, V>
 where
-    K: Hash + Eq,
+    K: Hash + Eq + Clone,
 {
-    arena: Vec<Node<K, V>>, //熱點儲存排序 
-    index: HashMap<K, usize>, //索引 
-    counter_sum: usize, //呼叫總和 預設：0
-    evict_point:usize, //平均對應節點 預設：capacity/2
-    capacity:usize, //自定義容器
+    arena: Vec<Node<K, V>>, // Physical rank: Index 0 is highest rank
+    index: HashMap<K, usize>, // Maps Key -> Index in arena
+    counter_sum: u64, 
+    evict_point: usize, // The dynamic membrane index
+    capacity: usize,
 }
 
+// The thread-safe wrapper
 pub struct DualCache<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    main: Mutex<Cache<K, V>>,// 操作
-    mirror: Arcswap<Cache<K, V>>, //映射查詢
-    lazy_update:Mutex<VecDeque<CacheAction<K>>>, //main操作緩衝
-}
-
-impl DualCache{
-    fn daemon;
+    main: Mutex<Cache<K, V>>, // Write Master
+    mirror: ArcSwap<Cache<K, V>>, // Read Replica (Snapshot)
+    lazy_update: Mutex<VecDeque<K>>, // Buffer for async updates (optional implementation)
 }
 ```
 
- 
+# 2. Logic Specification (The Physics)
+
+Implement the methods for `Cache` and `DualCache` following these EXACT rules:
+
+## A. `Cache::get(key)` -> "The Viscous Climb"
+1. Look up key in `index`.
+2. If found at `current_idx`:
+   - **Physics Rule**: Atoms struggle to move up. 
+   - **Action**: If `current_idx > 0`, perform a physical `arena.swap(current_idx, current_idx - 1)`.
+   - **Update**: Update `index` map for both swapped keys.
+   - **Return**: Clone of the value.
+   - **Constraint**: NEVER move directly to index 0. Only swap one step forward.
+
+## B. `Cache::insert(key, value)` -> "The Gatsby Injection"
+1. **Eviction**: 
+   - If `arena` is full (`len == capacity`), the victim is ALWAYS the physical tail (`arena.last()`). 
+   - Remove victim from `index`, overwrite `arena[last]` with new data.
+   - Update `index`.
+   - If not full, push to end.
+2. **Placement (The Gatsby Rule)**:
+   - Calculate `entry_gate = evict_point + 1`.
+   - Condition: If `arena.len() > capacity / 2` AND the new item is at the tail:
+     - **Action**: `arena.swap(tail_index, entry_gate)`.
+     - **Meaning**: New items bypass the death zone (tail) and enter the "Probation Zone" just behind the evict_point.
+
+## C. `Cache::update_evict_point()` -> "The Membrane Breath"
+- Trigger this occasionally (e.g., during insert or get).
+- **Condition**: If `arena.len() > capacity / 2`.
+- **Logic**:
+  - Calculate `avg = counter_sum / arena.len()`.
+  - Check item at `arena[evict_point]`.
+  - If `item.counter < avg`:
+    - It is weak. It belongs in the Danger Zone.
+    - Action: `evict_point += 1` (Expand the safe zone / Push item out).
+  - Else (Strong item):
+    - It holds the line. Keep `evict_point` as is (or conceptually push it slightly back, but keep logic simple).
+
+## D. `Cache::maintenance()` -> "Time Decay"
+- Iterate through all nodes in `arena`.
+- Action: `node.counter >>= 1` (Bitwise right shift).
+- Reset `counter_sum` based on new values.
+
+# 3. DualCache Concurrency Strategy
+- **Read Path (`get`)**: 
+  - Try reading from `mirror` (ArcSwap) first (lock-free).
+  - If hit, return. 
+  - *Note*: Since `mirror` is a snapshot, strictly strictly speaking, the "Swap-One" logic implies a write. For this implementation, assume `get` acquires the `main` lock to perform the swap (or pushes to `lazy_update` queue). 
+  - **Requirement**: Implement `get` by locking `main` for correctness in this version (simplest path).
+
+# 4. Output Requirements
+- Write idiomatic Rust code.
+- Use `entry` API for HashMap where appropriate.
+- Ensure `evict_point` stays within bounds.
+- Provide comments explaining *why* a specific swap happens (e.g., "// Gatsby protection swap").
+```
