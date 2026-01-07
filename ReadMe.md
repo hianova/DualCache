@@ -103,7 +103,6 @@ Implement the `DualCache` system in Rust.
 # 1. Data Structures (Immutable Contract)
 Use these exact struct definitions. Do not change them.
 
-```rust
 use std::sync::Arc;
 use parking_lot::Mutex; // Preferred over std::sync::Mutex for performance
 use arc_swap::ArcSwap;
@@ -139,7 +138,6 @@ where
     mirror: ArcSwap<Cache<K, V>>, // Read Replica (Snapshot)
     lazy_update: Mutex<VecDeque<K>>, // Buffer for async updates (optional implementation)
 }
-```
 
 # 2. Logic Specification (The Physics)
 
