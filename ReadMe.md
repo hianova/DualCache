@@ -40,7 +40,7 @@ pub struct DualCache<K, V> {
     sub: Cache<K, V>,  
     
     // Asynchronous control plane for handling batched updates.
-    lazy_update: DeqVec, 
+    lazy_update: Mutex<VecDeque<K>>, 
 }
 ```
 
