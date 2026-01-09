@@ -201,12 +201,20 @@ Instead, implement "Swap-to-Death":
   - Execute **"The Exile Protocol"** (as defined above).
   - *Optimization*: Since we are iterating, we can maintain a "swap window" to keep the array compact without `pop` overhead, or just repeatedly call the O(1) remove.
 
-# 3. DualCache Concurrency Strategy
+# 3. DualCache Concurrency Strategy (High-Performance Read)
 - **Read Path (`get`)**: 
-  - Try reading from `mirror` (ArcSwap) first (lock-free).
-  - If hit, return. 
-  - *Note*: Since `mirror` is a snapshot, strictly strictly speaking, the "Swap-One" logic implies a write. For this implementation, assume `get` acquires the `main` lock to perform the swap (or pushes to `lazy_update` queue). 
-  - **Requirement**: Implement `get` by locking `main` for correctness in this version (simplest path).
+  - MUST be Lock-Free / Wait-Free.
+  - Action 1: Read from `mirror` (ArcSwap).
+  - Action 2: If key exists, push the key into `lazy_update` (Mutex<VecDeque>) for asynchronous ranking updates.
+  - Return the value immediately.
+  - **Constraint**: DO NOT lock `main` in the `get` method.
+
+- **Daemon Path (`daemon_tick`)**:
+  - This method handles the physical mutations.
+  - Action 1: Drain the `lazy_update` queue.
+  - Action 2: Acquire `main` lock.
+  - Action 3: Apply "Viscous Climb" logic for all keys in the queue.
+  - Action 4: If changes occurred, update `mirror` with a new snapshot (`main.clone()`).
 
 # 4. Output Requirements
 - Write idiomatic Rust code.
