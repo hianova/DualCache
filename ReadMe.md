@@ -1,224 +1,103 @@
 
 # DualCache
 
-> **Status: Experimental / Proof of Concept**
->
-> *A high-performance, concurrency-friendly caching architecture designed for read-heavy, power-law distributed workloads.*
+**DualCache** is a high-performance, thread-safe caching system in Rust designed for extreme read concurrency. It prioritizes **latency stability** and **lock-free reads** over strict accounting precision, utilizing a statistical approach to ranking and eviction.
 
-## 📖 Introduction
-
-**DualCache** is a Rust-based caching library that challenges the traditional LRU/LFU implementations. Instead of relying on complex lock-free linked lists or micro-managed atomic memory orderings, DualCache leverages a **Blue-Green Deployment Architecture** (Double Buffering) to separate reads from writes completely.
-
-This design eliminates reader lock contention and optimizes for **CPU Cache Locality** by using contiguous memory layouts (`Vec`) instead of pointer chasing. It is specifically engineered for systems where **throughput** and **tail latency stability** are critical, such as high-frequency trading systems, blockchain state storage, and high-traffic web services.
+Unlike traditional LRU/LFU caches that rely on heavy locking or complex linked lists, DualCache employs a **"Viscous Array"** topology with a **Read-Write Separation** architecture.
 
 ## 🚀 Key Features
 
-### 1. Blue-Green Architecture (Read-Write Splitting)
-*   **Zero-Contention Reads:** Utilizes a `Main` (Writer) and `Sub` (Reader) structure. Readers access a "Snapshot" of the data, ensuring `O(1)` wait-free access without being blocked by ongoing writes or evictions.
-*   **Lazy Consistency:** Updates are batched and synchronized based on a "materiality" threshold, prioritizing system throughput over immediate strong consistency.
+*   **Lock-Free Read Path**: Readers access a read-only snapshot (`mirror`) via `ArcSwap`. No Mutex contention on the read path.
+*   **Viscous Climb Ranking**: Hot items physically bubble up the array (`index` swaps with `index - 1`) based on access, mimicking fluid dynamics.
+*   **Lossy Signaling (Backpressure)**: Access counters are updated via a bounded async channel. If the channel is full, the signal is **dropped**. This guarantees that ranking logic never blocks the reader.
+*   **Cliff-Edge Eviction**: Eviction is performed via `Vec::truncate` from a dynamic `evict_point`, instantly freeing capacity without iterating through linked lists.
+*   **Lazy Validation**: Handles dangling indices (caused by async truncation) via O(1) boundary and key checks during reads.
+*   **Swap-to-Delete**: Deletions are O(1) by swapping the target with the physical tail and popping, preserving memory density.
 
-### 2. Statistical Eviction Protocol
-*   **Mean-Based Threshold:** Instead of a rigid LRU queue, eviction is determined by dynamic statistical analysis (Global Counter Sum / Count). This effectively handles **Power-Law (Zipfian) Distributions** where "legacy authorities" (historically hot items) should not be evicted due to temporary inactivity.
-*   **Legacy Protection:** A "Grandfather Clause" mechanism prevents high-value data from being flushed out by short-term traffic spikes (Scan Resistance).
+## 🏗 Architecture
 
-### 3. Hardware-Aware Optimization
-*   **Vec > Linked List:** All data resides in contiguous `Vec` structures. Reordering is done via `swap` or memory rotation, maximizing **L1/L2 Cache Hits** and avoiding the expensive pointer chasing found in traditional cache implementations.
-*   **Simplicity by Design:** Intentionally avoids complex `Relaxed`/`Acquire` atomic orderings in favor of a macro-architectural design that eliminates the *need* for fine-grained synchronization.
+DualCache splits the world into two dimensions to solve the "Read-as-Write" lock contention problem:
 
-### 4. Batching & Compression (Log Compaction)
-*   **DeqVec Queue:** Write operations and promotion requests are buffered in a queue.
-*   **Noise Filtering:** The system employs a "Log Compaction" strategy to merge redundant updates (e.g., +1, +1, +1 → +3) before applying them, significantly reducing write amplification.
+1.  **The Mirror (Read-Path)**: An `ArcSwap<Cache>` snapshot. Readers access this lock-free.
+2.  **The Main (Write-Path)**: A `Mutex<Cache>` protected master copy.
+3.  **The Signal Channel**: A bounded MPSC channel (`Sender<K>`). Readers throw keys into this channel to signal "hits".
+4.  **The Daemon**: A background worker that drains the channel, updates the `Main` structure (ranking/counters), and periodically updates the `Mirror`.
 
-## 🛠️ Architecture Overview
+## ⚙️ Core Mechanisms
+
+### 1. The Viscous Climb (Read Promotion)
+When a key is accessed:
+1.  The reader sends the key to the Daemon (Fire-and-forget).
+2.  The Daemon increments the counter.
+3.  **Physics**: The item swaps places with the item at `index - 1`.
+    *   *Result*: Hot items naturally rise to the top. Cold items are physically pushed down by the rising hot items.
+
+### 2. The Gatsby Injection (Insertion)
+New items are not placed at the top. They are swapped into the **"Probation Zone"** (just after `evict_point + 1`). They must earn their way to the top via reads; otherwise, they are prime candidates for the next eviction.
+
+### 3. Cliff-Edge Eviction
+Instead of removing items one by one:
+1.  A dynamic `evict_point` is calculated based on the average hit count (`counter_sum / len`).
+2.  Items below the average are candidates for eviction.
+3.  When capacity is full, the underlying vector is **truncated** at `evict_point`.
+    *   *Note*: This may leave "dangling indices" in the HashMap, which are lazily cleaned up during the next read attempt.
+
+### 4. Lossy Statistics
+We accept that under extreme load (e.g., DDoS), accurate counting is impossible without blocking.
+*   **Policy**: If the update channel is full, **drop the packet**.
+*   **Theory**: Statistical Law of Large Numbers. High-frequency keys will still statistically dominate the ranking even with 5-10% signal loss. Latency consistency is preferred over perfect accounting.
+
+## 📦 Installation & Usage
+
+Add `crossbeam-channel`, `parking_lot`, and `arc-swap` to your `Cargo.toml`.
+
+```rust
+use std::sync::Arc;
+use std::thread;
+use dual_cache::DualCache; // Assuming crate name
+
+fn main() {
+    // 1. Initialize DualCache with capacity 1,000,000
+    // Returns the Cache instance (Arc) and the Receiver for the Daemon
+    let (cache, rx) = DualCache::new(1_000_000);
+
+    // 2. Spawn the Daemon (The Maintenance Worker)
+    let cache_for_daemon = cache.clone();
+    thread::spawn(move || {
+        // The Daemon drains the queue and performs physical mutations
+        while let Ok(key) = rx.recv() {
+            // Internal logic: 
+            // - Locks Main
+            // - Updates Counter / Performs Viscous Climb
+            // - Updates Mirror Snapshot occasionally
+            cache_for_daemon.handle_update(key); 
+        }
+    });
+
+    // 3. High-Concurrency Reads (Lock-Free)
+    let cache_ref = cache.clone();
+    thread::spawn(move || {
+        if let Some(value) = cache_ref.get(&"my_key") {
+            println!("Got value: {:?}", value);
+        }
+    });
+}
+```
+
+## 🧩 Data Structures
 
 ```rust
 pub struct DualCache<K, V> {
-    // The "Writer" - Handles mutations, evictions, and heavy lifting.
-    main: Cache<K, V>, 
-    
-    // The "Reader" - A lightweight, read-only snapshot for high-throughput access.
-    sub: Cache<K, V>,  
-    
-    // Asynchronous control plane for handling batched updates.
-    lazy_update: Mutex<VecDeque<K>>, 
+    main: Mutex<Cache<K, V>>,       // Write Master
+    mirror: ArcSwap<Cache<K, V>>,   // Read Replica
+    lazy_tx: Sender<K>,             // Async Signal Channel
 }
 ```
 
-### The "Sweet Spot" Philosophy
-DualCache is built on the belief that **Architecture > Micro-optimization**. By isolating readers from writers and using statistical averages for eviction, we achieve a system that is:
-1.  **Robust:** Resistant to cache thrashing.
-2.  **Predictable:** Flat latency curves with minimal jitter.
-3.  **Maintainable:** Simple, reasoning-friendly code without `unsafe` spaghetti.
+## ⚖️ Performance Philosophy
 
-## 📦 Usage
+*   **P99 Stability**: By decoupling the accounting logic from the read path, `Read` operations are purely memory lookups + a non-blocking channel send. Even if the Daemon stalls, readers continue to serve data at microsecond speeds.
+*   **Self-Healing**: "Zombie" data (data swapped into high ranks due to deletion logic) is naturally purged. If it is cold, real hot data will "climb" over it, pushing the zombie down to the eviction zone automatically.
 
-*(Note: The API is subject to change as this is a Proof of Concept)*
+## License
 
-```rust
-use dual_cache::DualCache;
-use std::sync::Arc;
-
-fn main() {
-    // Initialize DualCache
-    let cache = DualCache::new();
-
-    // Insert data (Goes to Main, eventually synced to Sub)
-    cache.insert("user_123", "SessionData");
-
-    // High-concurrency read (Hits Sub, wait-free)
-    if let Some(value) = cache.get("user_123") {
-        println!("Found: {}", value);
-    }
-    
-    // The daemon/scheduler handles eviction and sync in the background
-    // based on statistical analysis of traffic patterns.
-}
-```
-
-## 🔮 Roadmap
-
-*   [ ] **Micro-Benchmarks:** Comparative analysis against `moka`, `dashmap`, and standard `RwLock`.
-*   [ ] **Fuzz Testing:** Using `loom` to verify concurrency safety under extreme chaos.
-*   [ ] **Adaptive Thresholds:** Implementing linear regression to predict traffic gaps for optimal sync timing.
-
-## 📄 License
-
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
----
-**Disclaimer:** This project is an architectural study in high-performance system design. While the logic is sound, it is currently in an experimental phase. Contributions and discussions are welcome.
-
-## 🤖AI generate code promt
-
-```
-# Role
-You are a Senior Systems Architect and Rust Expert specializing in high-performance, non-standard data structures.
-
-# Objective
-Implement the `DualCache` system in Rust. 
-**CRITICAL WARNING**: This is a custom topology based on "Physical Location Flow" (Viscous Array). 
-- 🚫 DO NOT implement standard LRU/LFU logic. 
-- 🚫 DO NOT use `LinkedHashMap` or move-to-head on access.
-- ✅ Follow the specific "Swap-One" and "Evict-Point" logic described below.
-
-# 1. Data Structures (Immutable Contract)
-Use these exact struct definitions. Do not change them.
-
-use std::sync::Arc;
-use parking_lot::Mutex; // Preferred over std::sync::Mutex for performance
-use arc_swap::ArcSwap;
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
-
-#[derive(Clone, Debug)]
-pub struct Node<K, V> {
-    pub key: K, 
-    pub value: V, 
-    pub counter: u64, // Access frequency
-    pub time_stamp: u64, // For expiration check
-}
-
-// The internal storage unit
-struct Cache<K, V>
-where
-    K: Hash + Eq + Clone,
-{
-    arena: Vec<Node<K, V>>, // Physical rank: Index 0 is highest rank
-    index: HashMap<K, usize>, // Maps Key -> Index in arena
-    counter_sum: u64, 
-    evict_point: usize, // The dynamic membrane index
-    capacity: usize,
-}
-
-// The thread-safe wrapper
-pub struct DualCache<K, V>
-where
-    K: Hash + Eq + Clone,
-{
-    main: Mutex<Cache<K, V>>, // Write Master
-    mirror: ArcSwap<Cache<K, V>>, // Read Replica (Snapshot)
-    lazy_update: Mutex<VecDeque<K>>, // Buffer for async updates (optional implementation)
-}
-
-# 2. Logic Specification (The Physics)
-
-Implement the methods for `Cache` and `DualCache` following these EXACT rules:
-
-## A. `Cache::get(key)` -> "The Viscous Climb"
-1. Look up key in `index`.
-2. If found at `current_idx`:
-   - **Physics Rule**: Atoms struggle to move up. 
-   - **Action**: If `current_idx > 0`, perform a physical `arena.swap(current_idx, current_idx - 1)`.
-   - **Update**: Update `index` map for both swapped keys.
-   - **Return**: Clone of the value.
-   - **Constraint**: NEVER move directly to index 0. Only swap one step forward.
-
-## B. `Cache::insert(key, value)` -> "The Gatsby Injection"
-1. **Eviction**: 
-   - If `arena` is full (`len == capacity`), the victim is ALWAYS the physical tail (`arena.last()`). 
-   - Remove victim from `index`, overwrite `arena[last]` with new data.
-   - Update `index`.
-   - If not full, push to end.
-2. **Placement (The Gatsby Rule)**:
-   - Calculate `entry_gate = evict_point + 1`.
-   - Condition: If `arena.len() > capacity / 2` AND the new item is at the tail:
-     - **Action**: `arena.swap(tail_index, entry_gate)`.
-     - **Meaning**: New items bypass the death zone (tail) and enter the "Probation Zone" just behind the evict_point.
-
-## C. `Cache::update_evict_point()` -> "The Membrane Breath"
-- Trigger this occasionally (e.g., during insert or get).
-- **Condition**: If `arena.len() > capacity / 2`.
-- **Logic**:
-  - Calculate `avg = counter_sum / arena.len()`.
-  - Check item at `arena[evict_point]`.
-  - If `item.counter < avg`:
-    - It is weak. It belongs in the Danger Zone.
-    - Action: `evict_point += 1` (Expand the safe zone / Push item out).
-  - Else (Strong item):
-    - It holds the line. Keep `evict_point` as is (or conceptually push it slightly back, but keep logic simple).
-
-## D. `Cache::maintenance()` -> "Time Decay"
-- Iterate through all nodes in `arena`.
-- Action: `node.counter >>= 1` (Bitwise right shift).
-- Reset `counter_sum` based on new values.
-
-## E. `Cache::remove(key)` -> "The Exile Protocol" (O(1) Deletion)
-**CRITICAL**: DO NOT use `Vec::remove()`. That causes O(N) shifting.
-Instead, implement "Swap-to-Death":
-
-1. Look up `target_idx` in `index`.
-2. **The Swap**: 
-   - Swap the item at `target_idx` with the item at `arena.len() - 1` (The Physical Tail).
-   - Update the `index` map for the item that was at the tail (it has now moved to `target_idx`).
-3. **The Execution**:
-   - Now the target item is at the tail.
-   - Remove the key from `index`.
-   - Perform `arena.pop()` to physically remove it from the vector.
-   - *Result*: The hole is plugged by the tail element. Complexity is O(1).
-
-## F. `Cache::cleanup_expired()` -> "The Purge"
-- Iterate through arena.
-- For any node where `current_time - node.timestamp > ttl`:
-  - Execute **"The Exile Protocol"** (as defined above).
-  - *Optimization*: Since we are iterating, we can maintain a "swap window" to keep the array compact without `pop` overhead, or just repeatedly call the O(1) remove.
-
-# 3. DualCache Concurrency Strategy (High-Performance Read)
-- **Read Path (`get`)**: 
-  - MUST be Lock-Free / Wait-Free.
-  - Action 1: Read from `mirror` (ArcSwap).
-  - Action 2: If key exists, push the key into `lazy_update` (Mutex<VecDeque>) for asynchronous ranking updates.
-  - Return the value immediately.
-  - **Constraint**: DO NOT lock `main` in the `get` method.
-
-- **Daemon Path (`daemon_tick`)**:
-  - This method handles the physical mutations.
-  - Action 1: Drain the `lazy_update` queue.
-  - Action 2: Acquire `main` lock.
-  - Action 3: Apply "Viscous Climb" logic for all keys in the queue.
-  - Action 4: If changes occurred, update `mirror` with a new snapshot (`main.clone()`).
-
-# 4. Output Requirements
-- Write idiomatic Rust code.
-- Use `entry` API for HashMap where appropriate.
-- Ensure `evict_point` stays within bounds.
-- Provide comments explaining *why* a specific swap happens (e.g., "// Gatsby protection swap").
-```
