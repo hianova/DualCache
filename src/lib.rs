@@ -1,257 +1,343 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::Hash;
+use crossbeam::channel::{Sender, Receiver, bounded};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// -----------------------------------------------------------------------------
+// 1. Data Structures (Immutable Contract)
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct Node<K, V> {
-    pub key: K,
-    pub value: V,
-    pub counter: u64,
-    pub time_stamp: u64,
+    pub key: K, 
+    pub value: V, 
+    pub counter: u64, 
+    pub time_stamp: u64, 
 }
 
+#[derive(Clone)] // Derived to support Deep Clone for sync_mirror
 struct Cache<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    arena: Vec<Node<K, V>>,
-    index: HashMap<K, usize>,
-    counter_sum: u64,
-    evict_point: usize,
+    arena: Vec<Node<K, V>>, 
+    index: HashMap<K, usize>, 
+    counter_sum: u64, 
+    evict_point: usize, 
     capacity: usize,
-}
-
-impl<K, V> Cache<K, V>
-where
-    K: Hash + Eq + Clone,
-    V: Clone,
-{
-    fn new(capacity: usize) -> Self {
-        Self {
-            arena: Vec::with_capacity(capacity),
-            index: HashMap::with_capacity(capacity),
-            counter_sum: 0,
-            evict_point: 0,
-            capacity,
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<V> {
-        let current_idx = *self.index.get(key)?;
-        
-        // 增加存取計數器
-        self.arena[current_idx].counter += 1;
-        self.counter_sum += 1;
-        
-        // 黏性向上爬升：僅與前一個位置交換，不直接跳到頂端
-        if current_idx > 0 {
-            let prev_idx = current_idx - 1;
-            
-            // 執行物理交換
-            self.arena.swap(current_idx, prev_idx);
-            
-            // 更新索引映射：兩個被交換的鍵都需要更新位置
-            let swapped_key = self.arena[current_idx].key.clone();
-            self.index.insert(key.clone(), prev_idx);
-            self.index.insert(swapped_key, current_idx);
-        }
-        
-        Some(self.arena[self.index[key]].value.clone())
-    }
-
-    fn insert(&mut self, key: K, value: V, timestamp: u64) {
-        // 檢查是否已存在該鍵
-        if let Some(&existing_idx) = self.index.get(&key) {
-            self.arena[existing_idx].value = value;
-            self.arena[existing_idx].counter += 1;
-            self.arena[existing_idx].time_stamp = timestamp;
-            self.counter_sum += 1;
-            return;
-        }
-
-        let new_node = Node {
-            key: key.clone(),
-            value,
-            counter: 1,
-            time_stamp: timestamp,
-        };
-        self.counter_sum += 1;
-
-        // 驅逐邏輯：滿載時替換尾端受害者
-        if self.arena.len() == self.capacity {
-            let victim_key = self.arena.last().unwrap().key.clone();
-            self.index.remove(&victim_key);
-            self.counter_sum -= self.arena.last().unwrap().counter;
-            
-            let last_idx = self.arena.len() - 1;
-            self.arena[last_idx] = new_node;
-            self.index.insert(key.clone(), last_idx);
-        } else {
-            // 未滿時推入尾端
-            let new_idx = self.arena.len();
-            self.arena.push(new_node);
-            self.index.insert(key.clone(), new_idx);
-        }
-
-        // 蓋茲比規則：新進入者獲得保護，繞過死亡區
-        if self.arena.len() > self.capacity / 2 {
-            let tail_idx = self.arena.len() - 1;
-            let entry_gate = (self.evict_point + 1).min(tail_idx);
-            
-            if entry_gate < tail_idx {
-                // 執行蓋茲比保護交換
-                self.arena.swap(tail_idx, entry_gate);
-                
-                let gate_key = self.arena[tail_idx].key.clone();
-                self.index.insert(key.clone(), entry_gate);
-                self.index.insert(gate_key, tail_idx);
-            }
-        }
-
-        self.update_evict_point();
-    }
-
-    fn update_evict_point(&mut self) {
-        if self.arena.len() <= self.capacity / 2 {
-            return;
-        }
-
-        if self.arena.is_empty() {
-            return;
-        }
-
-        let avg = self.counter_sum / self.arena.len() as u64;
-        
-        // 確保驅逐點不超出範圍
-        if self.evict_point >= self.arena.len() {
-            self.evict_point = self.arena.len().saturating_sub(1);
-        }
-
-        // 膜呼吸：檢查驅逐點處的項目強度
-        if self.evict_point < self.arena.len() {
-            let item_counter = self.arena[self.evict_point].counter;
-            
-            if item_counter < avg {
-                // 弱項目：擴展安全區，將其推入危險區
-                self.evict_point = (self.evict_point + 1).min(self.arena.len().saturating_sub(1));
-            }
-            // 強項目：維持現狀，守住防線
-        }
-    }
-
-    fn maintenance(&mut self) {
-        self.counter_sum = 0;
-        
-        // 時間衰減：所有計數器右移一位
-        for node in &mut self.arena {
-            node.counter >>= 1;
-            self.counter_sum += node.counter;
-        }
-    }
-
-    fn remove(&mut self, key: &K) -> Option<V> {
-        let target_idx = *self.index.get(key)?;
-        
-        // 流放協議：交換至死亡位置實現 O(1) 刪除
-        let tail_idx = self.arena.len() - 1;
-        
-        if target_idx != tail_idx {
-            // 執行交換
-            self.arena.swap(target_idx, tail_idx);
-            
-            // 更新被交換到目標位置的項目索引
-            let moved_key = self.arena[target_idx].key.clone();
-            self.index.insert(moved_key, target_idx);
-        }
-        
-        // 執行處決
-        self.index.remove(key);
-        let removed = self.arena.pop()?;
-        self.counter_sum -= removed.counter;
-        
-        // 調整驅逐點以防止越界
-        if self.evict_point >= self.arena.len() && self.evict_point > 0 {
-            self.evict_point = self.arena.len().saturating_sub(1);
-        }
-        
-        Some(removed.value)
-    }
-
-    fn cleanup_expired(&mut self, current_time: u64, ttl: u64) {
-        let mut i = 0;
-        while i < self.arena.len() {
-            if current_time.saturating_sub(self.arena[i].time_stamp) > ttl {
-                let key = self.arena[i].key.clone();
-                self.remove(&key);
-                // 不增加 i，因為刪除後當前位置已是新項目
-            } else {
-                i += 1;
-            }
-        }
-    }
 }
 
 pub struct DualCache<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    main: Mutex<Cache<K, V>>,
+    main: Mutex<Cache<K, V>>, 
     mirror: ArcSwap<Cache<K, V>>,
-    lazy_update: Mutex<VecDeque<K>>,
+    lazy_tx: Sender<K>,
 }
+
+// -----------------------------------------------------------------------------
+// 2. Implementation Logic
+// -----------------------------------------------------------------------------
 
 impl<K, V> DualCache<K, V>
 where
-    K: Hash + Eq + Clone,
-    V: Clone,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
 {
-    pub fn new(capacity: usize) -> Self {
-        let cache = Cache::new(capacity);
-        Self {
-            main: Mutex::new(Cache::new(capacity)),
-            mirror: ArcSwap::new(Arc::new(cache)),
-            lazy_update: Mutex::new(VecDeque::new()),
-        }
+    /// A. Initialization
+    pub fn new(capacity: usize) -> (Arc<Self>, Receiver<K>) {
+        // Create bounded channel (e.g., 10,000 as suggested context)
+        let (tx, rx) = bounded(10_000);
+
+        let initial_cache = Cache {
+            arena: Vec::with_capacity(capacity),
+            index: HashMap::with_capacity(capacity),
+            counter_sum: 0,
+            evict_point: capacity, // Initialized to capacity per spec
+            capacity,
+        };
+
+        let dual_cache = Arc::new(Self {
+            main: Mutex::new(initial_cache.clone()),
+            mirror: ArcSwap::from_pointee(initial_cache),
+            lazy_tx: tx,
+        });
+
+        (dual_cache, rx)
     }
 
+    /// B. The Read Path (Lock-Free & Lossy)
     pub fn get(&self, key: &K) -> Option<V> {
-        // 為正確性起見，直接鎖定主快取執行黏性交換
-        let mut main = self.main.lock();
-        main.get(key)
+        // 1. Snapshot Access
+        let cache_guard = self.mirror.load();
+        
+        // 2. Lazy Validation
+        if let Some(&idx) = cache_guard.index.get(key) {
+            // CRITICAL CHECK: Verify index bounds and key identity
+            // Handles cases where index map points to truncated/reused slots
+            if idx < cache_guard.arena.len() && &cache_guard.arena[idx].key == key {
+                
+                // 3. Lossy Signaling
+                // Ignore error if full (Drop signal)
+                let _ = self.lazy_tx.try_send(key.clone());
+
+                // 4. Return value clone
+                return Some(cache_guard.arena[idx].value.clone());
+            }
+        }
+
+        None
     }
 
-    pub fn insert(&self, key: K, value: V, timestamp: u64) {
-        let mut main = self.main.lock();
-        main.insert(key, value, timestamp);
+    /// Internal helper to sync Main state to Mirror
+    fn sync_mirror(&self) {
+        let main_lock = self.main.lock();
+        // Deep Clone of the current main state
+        let snapshot = main_lock.clone();
+        // Update ArcSwap
+        self.mirror.store(Arc::new(snapshot));
+    }
+    
+    // Public wrappers for Write/Daemon operations (to be called by the Daemon thread)
+    // In a real system, these would likely be called by a worker processing `rx`.
+    
+    pub fn process_read_signal(&self, key: K) {
+        let mut guard = self.main.lock();
+        guard.viscous_climb(key);
     }
 
-    pub fn remove(&self, key: &K) -> Option<V> {
-        let mut main = self.main.lock();
-        main.remove(key)
+    pub fn insert(&self, key: K, value: V, ttl_secs: u64) {
+        let mut guard = self.main.lock();
+        guard.gatsby_insert(key, value, ttl_secs);
+    }
+
+    pub fn delete(&self, key: &K) {
+        let mut guard = self.main.lock();
+        guard.double_swap_delete(key);
     }
 
     pub fn maintenance(&self) {
-        let mut main = self.main.lock();
-        main.maintenance();
+        let mut guard = self.main.lock();
+        guard.update_evict_point();
     }
-
-    pub fn cleanup_expired(&self, current_time: u64, ttl: u64) {
-        let mut main = self.main.lock();
-        main.cleanup_expired(current_time, ttl);
+    
+    pub fn update(&self, key: &K, value: V) {
+        let mut guard = self.main.lock();
+        guard.update_value(key, value);
     }
-
-    pub fn sync_mirror(&self) {
-        let main = self.main.lock();
-        let snapshot = Cache {
-            arena: main.arena.clone(),
-            index: main.index.clone(),
-            counter_sum: main.counter_sum,
-            evict_point: main.evict_point,
-            capacity: main.capacity,
-        };
-        self.mirror.store(Arc::new(snapshot));
+    
+    /// Must be called manually or periodically to refresh the read-view
+    pub fn commit(&self) {
+        self.sync_mirror();
     }
 }
-// code support by claude sonnet4.5
+
+// -----------------------------------------------------------------------------
+// 3. Internal Cache Logic (The Write Path)
+// -----------------------------------------------------------------------------
+
+impl<K, V> Cache<K, V>
+where
+    K: Hash + Eq + Clone,
+{
+    // Helper: Gets current time as u64
+    fn current_time() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    // Helper: Swaps two nodes and updates the index map
+    fn swap_nodes(&mut self, idx_a: usize, idx_b: usize) {
+        if idx_a == idx_b || idx_a >= self.arena.len() || idx_b >= self.arena.len() {
+            return;
+        }
+
+        self.arena.swap(idx_a, idx_b);
+
+        // Update indices for the swapped keys
+        let key_a = self.arena[idx_a].key.clone();
+        let key_b = self.arena[idx_b].key.clone();
+
+        self.index.insert(key_a, idx_a);
+        self.index.insert(key_b, idx_b);
+    }
+
+    /// C.1. Viscous Climb
+    fn viscous_climb(&mut self, key: K) {
+        // Find the key
+        let current_index = match self.index.get(&key) {
+            Some(&i) if i < self.arena.len() && self.arena[i].key == key => i,
+            _ => return, // Key not found or invalid
+        };
+
+        // Increment counter
+        self.arena[current_index].counter = self.arena[current_index].counter.saturating_add(1);
+        self.counter_sum = self.counter_sum.saturating_add(1);
+
+        // Expiration Check
+        let now = Self::current_time();
+        if now > self.arena[current_index].time_stamp {
+            // Swap expired node with evict_point + 1
+            let target = self.evict_point + 1;
+            
+            // Safety check: ensure target is within bounds. 
+            // If arena is small, we just remove it without the specific swap logic to avoid panic.
+            if target < self.arena.len() {
+                self.swap_nodes(current_index, target);
+            }
+            
+            // Remove from index (effectively validating the expiration)
+            // Note: The node remains in arena (garbage) until overwritten or truncated
+            self.index.remove(&key);
+            return;
+        }
+
+        // Physics: Swap with current_index - 1 (Move towards 0)
+        if current_index > 0 {
+            self.swap_nodes(current_index, current_index - 1);
+        }
+    }
+
+    /// C.2. The Gatsby Insert
+    fn gatsby_insert(&mut self, key: K, value: V, ttl_secs: u64) {
+        // Eviction Trigger
+        if self.arena.len() == self.capacity {
+            // Cliff-Edge Eviction: Truncate to evict_point
+            // NOTE: Do not clean up index map here (Lazy Validation handles it)
+            if self.evict_point < self.arena.len() {
+                self.arena.truncate(self.evict_point);
+            }
+        }
+
+        // Check if key already exists to avoid duplicates (standard cache behavior),
+        // though spec focuses on "Placement". Assuming new key or overwrite via update.
+        if self.index.contains_key(&key) {
+            self.update_value(&key, value);
+            return;
+        }
+
+        // Placement
+        let time_stamp = Self::current_time() + ttl_secs;
+        let node = Node {
+            key: key.clone(),
+            value,
+            counter: 1, // Start with 1 visibility
+            time_stamp,
+        };
+        
+        // Push new node
+        self.arena.push(node);
+        let new_idx = self.arena.len() - 1;
+        self.index.insert(key, new_idx);
+        self.counter_sum = self.counter_sum.saturating_add(1);
+
+        // Swap Rule: Immediately swap new node with node at evict_point + 1
+        let target = self.evict_point + 1;
+        if target < self.arena.len() {
+            self.swap_nodes(new_idx, target);
+        }
+    }
+
+    /// C.3. The Double-Swap Delete
+    fn double_swap_delete(&mut self, key: &K) {
+        let idx = match self.index.get(key) {
+            Some(&i) if i < self.arena.len() && &self.arena[i].key == key => i,
+            _ => return,
+        };
+
+        let target_swap_1 = self.evict_point + 1;
+        
+        // If the arena is too small to support the specific swap logic, just swap remove.
+        if target_swap_1 >= self.arena.len() {
+            // Fallback for small arenas/edge cases
+            self.arena.swap_remove(idx);
+            if idx < self.arena.len() {
+                // swap_remove moved last to idx, update its index
+                let moved_key = self.arena[idx].key.clone();
+                self.index.insert(moved_key, idx);
+            }
+            self.index.remove(key);
+            return;
+        }
+
+        // Step 1: Swap arena[idx] with arena[evict_point + 1]
+        self.swap_nodes(idx, target_swap_1);
+
+        // Step 2: Swap arena[evict_point + 1] (the target) with arena.last()
+        let last_idx = self.arena.len() - 1;
+        self.swap_nodes(target_swap_1, last_idx);
+
+        // Step 3: Pop
+        if let Some(node) = self.arena.pop() {
+            self.index.remove(&node.key);
+        }
+    }
+
+    /// C.4. Dynamic Membrane
+    fn update_evict_point(&mut self) {
+        if self.arena.is_empty() {
+            return;
+        }
+
+        let avg = self.counter_sum / (self.arena.len() as u64).max(1);
+        let step_size = (self.capacity / 10).max(1);
+
+        // Check if average suggests expansion (simple heuristic based on activity)
+        // If the global sum is high relative to length, traffic is high, widen the safe zone.
+        // (Logic inferred from "Counter sum suggests avg has increased")
+        // Note: Real implementation might track previous avg to detect increase.
+        // Here we assume high average score implies we need more space protected.
+        
+        // Expansion logic: If evict point is small but avg is high, move evict_point forward (larger index)
+        if self.evict_point < self.capacity {
+             // Heuristic: If we are truncating too aggressively but nodes are hot
+            self.evict_point = (self.evict_point + step_size).min(self.capacity);
+        }
+
+        // Contraction: If the node AT evict_point is Strong (counter > avg)
+        // It "holds the line", effectively pushing the membrane back (or resisting move).
+        // Spec: "If node at evict_point has counter > avg... it holds the line."
+        // Interpreted as: If the border node is strong, we don't truncate it easily, 
+        // so we might actually reduce evict_point to tighten the circle or keep it there.
+        // HOWEVER, context implies "Membrane" moves to optimize cache.
+        // Let's implement Contraction as reducing `evict_point` if the boundary is weak?
+        // No, prompt says: "If node ... > avg (Strong Node), it holds the line."
+        // This usually implies preventing the evict_point from moving past it (shrinking the safe zone).
+        
+        // Let's implement a specific check:
+        if self.evict_point < self.arena.len() {
+            let boundary_node = &self.arena[self.evict_point];
+            if boundary_node.counter > avg {
+                // Strong node at border. 
+                // We do NOT contract (reduce index). We leave it or expand.
+            } else {
+                // Weak node at border. The membrane contracts (moves toward 0),
+                // making the "safe zone" smaller and "at risk" zone larger.
+                self.evict_point = self.evict_point.saturating_sub(step_size);
+            }
+        }
+        
+        // Safety: Ensure evict_point stays within bounds relative to capacity
+        if self.evict_point > self.capacity {
+            self.evict_point = self.capacity;
+        }
+    }
+
+    /// C.5. Updates
+    fn update_value(&mut self, key: &K, value: V) {
+         if let Some(&idx) = self.index.get(key) {
+             if idx < self.arena.len() && &self.arena[idx].key == key {
+                 self.arena[idx].value = value;
+                 // Constraint: Do NOT reset counter or rank (index).
+                 // Done.
+             }
+         }
+    }
+}
+//code support by gemini 3.0
